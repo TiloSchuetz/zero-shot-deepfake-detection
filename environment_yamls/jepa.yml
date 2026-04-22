@@ -4,9 +4,7 @@ channels:
   - defaults
   - nvidia
   - pytorch
-  - anaconda
-  - https://repo.anaconda.com/pkgs/main
-  - https://repo.anaconda.com/pkgs/r
+  - fastai
 dependencies:
   - 7zip=26.00=h171cf75_0
   - _libgcc_mutex=0.1=main
@@ -42,18 +40,21 @@ dependencies:
   - beautifulsoup4=4.14.3=py310h06a4308_0
   - blas=1.0=mkl
   - bleach=6.3.0=py310h06a4308_0
+  - bokeh=3.8.2=py310h06a4308_0
   - bottleneck=1.4.2=py310haa0f9ac_1
   - brotlicffi=1.2.0.0=py310h7354ed3_0
   - bzip2=1.0.8=h5eee18b_6
   - c-ares=1.34.6=hd44998d_0
-  - ca-certificates=2026.2.25=hbd8a1cb_0
+  - ca-certificates=2026.3.19=h06a4308_0
   - cairo=1.18.4=h44eff21_0
   - certifi=2026.2.25=pyhd8ed1ab_0
   - cffi=2.0.0=py310h4eded50_1
   - charset-normalizer=3.4.4=py310h06a4308_0
   - click=8.2.1=py310h06a4308_1
+  - cloudpickle=3.1.2=py310h06a4308_0
   - comm=0.2.3=py310h06a4308_0
   - contourpy=1.3.1=py310hdb19cb5_0
+  - cpython=3.10.20=py310hd8ed1ab_0
   - cuda-cudart=11.8.89=0
   - cuda-cupti=11.8.87=0
   - cuda-libraries=11.8.0=0
@@ -63,12 +64,16 @@ dependencies:
   - cuda-version=12.9=3
   - cycler=0.12.1=py310h06a4308_0
   - cyrus-sasl=2.1.28=h83b0a09_4
+  - cytoolz=1.1.0=py310h47b2149_1
+  - dask=2026.1.2=pyhcf101f3_0
+  - dask-core=2026.1.2=py310h06a4308_0
   - datasets=4.6.1=pyhcf101f3_0
   - dav1d=1.2.1=h5eee18b_0
   - debugpy=1.8.16=py310hbdd6827_1
   - decorator=5.2.1=py310h06a4308_0
   - defusedxml=0.7.1=pyhd3eb1b0_0
   - dill=0.4.0=py310h06a4308_0
+  - distributed=2026.1.2=py310h06a4308_0
   - et_xmlfile=2.0.0=py310h06a4308_0
   - exceptiongroup=1.3.0=py310h06a4308_0
   - executing=2.2.1=py310h06a4308_0
@@ -90,13 +95,15 @@ dependencies:
   - graphite2=1.3.14=h295c915_1
   - h11=0.16.0=py310h06a4308_1
   - harfbuzz=12.3.0=h79d275a_1
+  - heapdict=1.0.1=pyhd3eb1b0_0
   - hf-xet=1.2.0=py310h8c4cd34_0
   - html5lib=1.1=pyhd3eb1b0_0
   - httpcore=1.0.9=py310h06a4308_0
   - httpx=0.28.1=py310h06a4308_1
-  - huggingface_hub=1.3.3=py310h7040dfc_0
+  - huggingface_hub=1.5.0=pyhd8ed1ab_0
   - icu=73.1=h6a678d5_0
   - idna=3.11=py310h06a4308_0
+  - importlib-metadata=8.7.1=py310h06a4308_0
   - intel-openmp=2021.4.0=h06a4308_3561
   - ipykernel=7.2.0=py310h7040dfc_0
   - ipython=8.30.0=py310h06a4308_0
@@ -192,11 +199,15 @@ dependencies:
   - libzlib=1.3.1=hb25bd0a_0
   - llvm-openmp=14.0.6=h9e868ea_0
   - lmdb=0.9.31=hb25bd0a_0
+  - locket=1.0.0=py310h06a4308_0
+  - lz4=4.4.5=py310ha9de75d_0
   - lz4-c=1.9.4=h6a678d5_1
+  - markdown-it-py=4.0.0=py310h06a4308_1
   - markupsafe=3.0.2=py310h5eee18b_0
   - matplotlib=3.9.1=py310hff52083_1
   - matplotlib-base=3.9.1=py310hf02ac8c_2
   - matplotlib-inline=0.2.1=py310h06a4308_0
+  - mdurl=0.1.2=py310h06a4308_0
   - mesalib=25.1.5=h31e3550_0
   - mistune=3.1.2=py310h06a4308_0
   - mkl=2021.4.0=h06a4308_640
@@ -206,10 +217,12 @@ dependencies:
   - mpc=1.3.1=h5eee18b_0
   - mpfr=4.2.1=h5eee18b_0
   - mpmath=1.3.0=py310h06a4308_0
+  - msgpack-python=1.1.1=py310h6a678d5_0
   - multidict=6.7.1=py310h47b2149_0
   - multiprocess=0.70.18=py310h06a4308_1
   - mysql-common=9.3.0=h9e076cb_5
   - mysql-libs=9.3.0=h6ecde68_5
+  - narwhals=2.7.0=py310h06a4308_0
   - nbclient=0.10.4=py310h06a4308_0
   - nbconvert-core=7.17.0=py310h06a4308_0
   - nbformat=5.10.4=py310h06a4308_0
@@ -222,6 +235,7 @@ dependencies:
   - numexpr=2.8.4=py310h8879344_0
   - numpy=1.24.3=py310hd5efca6_0
   - numpy-base=1.24.3=py310h8e6c178_0
+  - nvidia-ml-py3=7.352.0=py_0
   - openh264=2.1.1=h4ff587b_0
   - openldap=2.6.12=hb446bd0_0
   - openpyxl=3.1.5=py310h5eee18b_1
@@ -233,6 +247,7 @@ dependencies:
   - pandas=2.3.3=py310h23c847b_1
   - pandocfilters=1.5.1=py310h06a4308_0
   - parso=0.8.5=py310h06a4308_0
+  - partd=1.4.2=py310h06a4308_0
   - pcre2=10.46=hf426167_0
   - pexpect=4.9.0=py310h06a4308_1
   - pillow=12.1.1=py310h8263a33_0
@@ -260,6 +275,7 @@ dependencies:
   - python-dateutil=2.9.0post0=py310h06a4308_2
   - python-fastjsonschema=2.21.2=py310h06a4308_0
   - python-json-logger=4.0.0=py310h06a4308_0
+  - python-lmdb=1.7.5=py310hbe636e0_0
   - python-tzdata=2025.3=pyhd3eb1b0_0
   - python-xxhash=3.5.0=py310h5eee18b_0
   - python_abi=3.10=3_cp310
@@ -280,9 +296,11 @@ dependencies:
   - re2=2025.11.05=h71b5c5c_1
   - readline=8.3=hc2a1206_0
   - referencing=0.37.0=py310h06a4308_0
+  - regex=2026.2.28=py310h47b2149_0
   - requests=2.32.5=py310h06a4308_1
   - rfc3339-validator=0.1.4=py310h06a4308_0
   - rfc3986-validator=0.1.1=py310h06a4308_0
+  - rich=14.2.0=py310h06a4308_0
   - rpds-py=0.28.0=py310h498d7c9_0
   - s2n=1.6.2=h02aa81b_0
   - safetensors=0.7.0=py310h6e1b9ff_0
@@ -295,25 +313,32 @@ dependencies:
   - six=1.17.0=py310h06a4308_0
   - snappy=1.2.2=h4bcf44c_1
   - sniffio=1.3.1=py310h06a4308_0
+  - sortedcontainers=2.4.0=pyhd3eb1b0_0
   - soupsieve=2.5=py310h06a4308_0
   - spirv-tools=2025.1=hdb19cb5_0
   - sqlite=3.51.1=he0a8d7e_0
   - stack_data=0.6.3=py310h06a4308_0
   - tbb=2022.3.0=h698db13_0
   - tbb-devel=2022.3.0=h698db13_0
+  - tblib=3.2.2=py310h06a4308_0
   - terminado=0.18.1=py310h06a4308_1
   - threadpoolctl=3.5.0=py310h7040dfc_1
   - timm=1.0.25=pyhcf101f3_0
   - tinycss2=1.4.0=py310h06a4308_0
   - tk=8.6.15=h54e0aa7_0
+  - tokenizers=0.22.2=py310hac4c11a_1
   - tomli=2.4.0=py310h06a4308_0
+  - toolz=1.1.0=py310h06a4308_0
   - torchaudio=2.5.1=py310_cu118
   - torchtriton=3.1.0=py310
   - torchvision=0.20.1=py310_cu118
   - tornado=6.5.4=py310h47b2149_0
   - tqdm=4.67.3=py310h7040dfc_1
   - traitlets=5.14.3=py310h06a4308_0
+  - transformers=5.4.0=pyhd8ed1ab_0
+  - typer=0.20.0=py310h06a4308_1
   - typer-slim=0.20.0=py310h06a4308_1
+  - typer-slim-standard=0.20.0=py310h06a4308_1
   - typing-extensions=4.15.0=py310h06a4308_0
   - typing_extensions=4.15.0=py310h06a4308_0
   - tzdata=2026a=he532380_0
@@ -347,16 +372,18 @@ dependencies:
   - xorg-libxxf86vm=1.1.6=h9b100fa_0
   - xorg-xorgproto=2024.1=h5eee18b_1
   - xxhash=0.8.0=h7f8727e_3
+  - xyzservices=2025.4.0=py310h06a4308_0
   - xz=5.8.2=h448239c_0
   - yaml=0.2.5=h7b6447c_0
   - yarl=1.22.0=py310hee96239_0
   - zeromq=4.3.5=hb0a5e54_1
+  - zict=3.0.0=py310h06a4308_1
+  - zipp=3.23.0=py310h06a4308_0
   - zlib=1.3.1=hb25bd0a_0
   - zstd=1.5.7=h11fc155_0
   - pip:
       - clip==1.0
-      - dtrx==8.7.1
       - ftfy==6.3.1
-      - regex==2026.2.28
+      - gdown==5.2.1
       - sympy==1.13.1
-prefix: /home/tmedi/miniconda3/envs/tilo_env
+prefix: /work/tischuet/miniconda3/envs/jepa

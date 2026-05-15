@@ -110,8 +110,11 @@ def main(args):
 
     print(filenames_labels.label.value_counts())
 
+    model_folder = OUTPUT_FOLDER_PATH / model_name.replace('.', '_')
+    model_folder.mkdir(parents=True, exist_ok=True)
+
     output_file = f"{model_name.replace('.', '_')}_{config['score_type']}_{dataset}.jsonl"
-    full_output_path = OUTPUT_FOLDER_PATH / output_file
+    full_output_path = model_folder / output_file
 
     # add metadata to json file
     if not full_output_path.exists():

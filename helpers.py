@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from torch.utils.data import DataLoader, Dataset
+from torch.autograd.functional import jacobian
 from PIL import Image
 import timm
 import os
@@ -8,6 +9,9 @@ import torch
 from typing import Tuple
 from pathlib import Path
 import json
+from sklearn.metrics import roc_auc_score, average_precision_score
+from statistics import mean
+
 
 class CustomImageDataset(Dataset):
     def __init__(self, annotations_file: pd.DataFrame, dataset_folder_path: str, img_dir: str, transform=None, target_transform=None):
@@ -88,8 +92,6 @@ def create_pd_data_paths(dataset_folder_path: str, folder_name: str) -> pd.DataF
     """
 
     dir_list_test = os.listdir(dataset_folder_path+folder_name)
-    #TODO: implement recursive
-    #TODO: sort files? tests show that there is no problem with reordering
 
     paths_labels = pd.DataFrame({
         "img_path": dir_list_test,
@@ -163,7 +165,7 @@ def resume_or_create_dataset_dataloader(
 
 
 def resume_or_create_dataset_dataloader_json(
-        csv_file_name: str,
+        output_path: Path,
         filenames_labels: pd.DataFrame,
         dataset_folder_path: str,
         data_folder: str,
@@ -172,6 +174,8 @@ def resume_or_create_dataset_dataloader_json(
         ) -> DataLoader[CustomImageDataset]:
     """
     Creates either a new or a resumed dataset and dataloader instance.
+    Assumes output_path exists and has a metadata line as line 1, followed by
+    one JSON record per scored image.
     Args:
         csv_file_name: string of filename of jsonl with computed JEPA-SCOREs.
         filenames_labels: pd.DataFrame with filenames and corresponding labels (0 or 1).
@@ -182,19 +186,21 @@ def resume_or_create_dataset_dataloader_json(
     Returns:
         DataLoader: returns a dataloader for the (remaining) images.
     """
-    file_path = Path(csv_file_name)
-    if file_path.exists():
-        print("Load existing JSONL file with JEPA-SCOREs.")
-        with open(csv_file_name, "r") as f:
-            next(f)  # skip metadata line
-            already_done = {json.loads(line)["img_path"] for line in f if line.strip()}
-        print(f"Already calculated {len(already_done)} JEPA-SCORES")
-        resumed_df = filenames_labels[~filenames_labels['img_path'].isin(already_done)]
-        test_dataset = CustomImageDataset(resumed_df, dataset_folder_path, data_folder, transform=transforms)
-    else:
-        print("No existing JSONL file found. Creating new one...")
-        test_dataset = CustomImageDataset(filenames_labels, dataset_folder_path, data_folder, transform=transforms)
 
+    assert output_path.exists(), f"Expected {output_path} to exist with metadata header."
+
+    with open(output_path, "r") as f:
+        next(f)  # skip metadata line. Assumes line 1 of an existing output file is the metadata header.
+        already_done = {json.loads(line)["img_path"] for line in f if line.strip()}
+    
+    if already_done:
+        print(f"Resuming: {len(already_done)} JEPA-SCORES already calculated.")
+    else:
+        print("Starting fresh run.")
+
+    resumed_df = filenames_labels[~filenames_labels['img_path'].isin(already_done)]
+    test_dataset = CustomImageDataset(resumed_df, dataset_folder_path, data_folder, transform=transforms)
+    
     data_loader = DataLoader(
         dataset=test_dataset,
         batch_size=batch_size,
@@ -204,3 +210,80 @@ def resume_or_create_dataset_dataloader_json(
     )
     print(f"Batch size of dataloader: {batch_size}")
     return data_loader
+
+def score_last_layer(model, img, vectorize, eps, enabled, label, dataset_path, dataset, img_path) -> pd.DataFrame:
+    """
+    Calculates singular value spectrum and final JEPA-SCORE based ∂f(x) / ∂x.
+    Args:
+        model: pretrained backbone.
+        img: batch of input images [B, C, H, W].
+        vectorize: flag if computation should be vectorized.
+        eps: constant for JEPA-SCORE calculation stability.
+        enabled: if bfloat16 should be enabled.
+        label: labels of images in batch.
+        dataset_path: directory path to dataset.
+        dataset: dataset name.
+        img_path: full directory path of image.
+    Returns:
+        batch results: pandas DataFrame with label, score, img_path and singular values spectrum for each image in batch.
+    """
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=enabled):
+        J = jacobian(lambda x: model(x).sum(0), inputs=img, vectorize=vectorize)
+    with torch.inference_mode():
+        J = J.flatten(2).permute(1, 0, 2).float() # .float() decouples SVD precision from autocast
+        svdvals = torch.linalg.svdvals(J) # D: size of embedding dimension
+        jepa_score = svdvals.clip_(eps).log_().sum(1)
+    
+    batch_results = pd.DataFrame({
+                "label": label.cpu().tolist(),
+                "score": jepa_score.cpu().tolist(),
+                "img_path": [x.removeprefix(dataset_path + dataset + "/") for x in img_path],
+                "svdvals": svdvals.cpu().tolist(),
+            })
+    return batch_results
+
+def calculate_metrics(full_output_path, dataset) -> None:
+    """
+    Calculates AUC and AP for each class, overall (pooled), macro-average and weighted-average AUC/AP.
+    Prints all metrics in a table.
+    Args:
+        full_output_path: path to output file
+        dataset: dataset name
+    Returns:
+        None
+    """
+
+    CLASSES = {
+        "ForenSynths": ["biggan", "crn", "cyclegan", "deepfake", "gaugan", "imle", "progan", "san", "seeingdark", "stargan", "stylegan", "stylegan2", "whichfaceisreal"],
+        "NewGenerators": None, #TODO
+        "GenImage": None, #TODO
+    }
+
+    with open(full_output_path, "r") as f:
+        next(f)  # skip metadata line
+        df = pd.read_json(f, lines=True)
+    print(len(df))
+    classes = CLASSES[dataset]
+    AUCs, APs, counts = [], [], []
+    for cls in classes:
+        subset = df[df["img_path"].str.split("/").str[0] == cls].copy()
+        AUCs.append(roc_auc_score(subset.label, subset.score))
+        APs.append(average_precision_score(subset.label, subset.score))
+        counts.append(len(subset))
+
+    total = sum(counts)
+    overall_auc = roc_auc_score(df.label, df.score)
+    overall_ap = average_precision_score(df.label, df.score)
+    macro_auc, macro_ap = mean(AUCs), mean(APs)
+    weighted_auc = sum(a * n for a, n in zip(AUCs, counts)) / total
+    weighted_ap  = sum(a * n for a, n in zip(APs,  counts)) / total
+
+    results = pd.DataFrame({
+        "class": classes + ["Overall (pooled)", "Macro-average", "Weighted-average"],
+        "N":     counts  + [total, None, total],
+        "AUC":   AUCs    + [overall_auc, macro_auc, weighted_auc],
+        "AP":    APs     + [overall_ap,  macro_ap,  weighted_ap],
+    })
+
+    print(f"\nResults on {dataset}")
+    print(results.to_string(index=False, float_format=lambda x: f"{x:.4f}"))

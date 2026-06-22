@@ -7,16 +7,18 @@ import timm
 from pathlib import Path
 from tqdm import tqdm
 from contextlib import nullcontext
-import pandas as pd
 import json
 from datetime import datetime, timezone
 
-from helpers import load_model, create_pd_data_paths, create_pd_data_paths_recursive, resume_or_create_dataset_dataloader_json, score_last_layer, calculate_metrics
+from helpers import load_model, create_pd_data_paths, create_pd_data_paths_recursive, create_pd_data_paths_New_Generators, resume_or_create_dataset_dataloader_json, score_last_layer, calculate_metrics, load_calibration_set, conditional_score_last_layer, score_all_layers, score_all_layers_fast
 
+#TODO simplify?
 DATASET_PATHS = {
     "ForenSynths": "/ceph/tischuet/replication_data/",
     "New-Generator": "/ceph/tischuet/replication_data/",
-    "Imagenet_val": "/ceph/tischuet/",
+    "Imagenet_val_5k": "/ceph/tischuet/",
+    "ForenSynths_val": "/ceph/tischuet/replication_data/",
+    "ForenSynths_rest": "/ceph/tischuet/replication_data/",
     }
 
 CONFIG_FOLDER_PATH = Path("./configs")
@@ -31,15 +33,19 @@ MODELS = {
     "vit_base_patch16_dinov3.lvd1689m",
     "vit_large_patch16_dinov3.lvd1689m",
     "vit_large_patch14_dinov2.lvd142m",
+    "vit_base_patch16_clip_224.openai",
+    "vit_base_patch32_clip_224.openai",
+    "vit_large_patch14_clip_224.openai",
     }
 
 REQUIRED_KEYS = {"model_name", "fast_settings", "dataset", "batch_size", "profiler",
-                 "vectorize", "score_type",}
+                 "vectorize", "score_type", "cal_set_path", "k_neighbors"}
 
 SCORERS = {
     "last_layer": score_last_layer,
-    "layerwise": None, #TODO implement drop in layer-wise JEPA-SCORE calcs with singular value spectrum
-    "local_last_layer": None, #TODO
+    "layerwise": score_all_layers, #TODO implement drop in layer-wise JEPA-SCORE calcs with singular value spectrum
+    "layerwise_fast": score_all_layers_fast,
+    "local_last_layer": conditional_score_last_layer,
 }
 
 def main(args):
@@ -50,9 +56,15 @@ def main(args):
         config = yaml.load(f, Loader=yaml.SafeLoader)
     
     # check if all necessary keys exist
-    missing = REQUIRED_KEYS - config.keys()
-    if missing:
-        raise ValueError(f"Config is missing required keys: {missing}")
+    if config["score_type"] in {"last_layer", "layerwise", "layerwise_fast"}:
+        missing = REQUIRED_KEYS - {"cal_set_path", "k_neighbors"} - config.keys()
+        if missing:
+            raise ValueError(f"Config is missing required keys: {missing}")
+    elif config["score_type"] == "local_last_layer":
+        missing = REQUIRED_KEYS - config.keys()
+        if missing:
+            raise ValueError(f"Config is missing required keys: {missing}")
+    else: raise ValueError(f"This score_type doesn't exist")
     
     # ----- 1. check for CUDA -----
 
@@ -81,11 +93,32 @@ def main(args):
     transforms = timm.data.create_transform(**data_config, is_training=False)
     model.requires_grad_(False)
 
+    # ----- 2.1 Pre-bake RoPE embedding to avoid cudagraph break (DINOv3) -----
+    if "dinov3" in model_name and device == "cuda":
+        img_size = data_config["input_size"][-1]
+        patch_size = model.patch_embed.patch_size[0]
+        H = W = img_size // patch_size
+
+        with torch.no_grad():
+            cached_embed = model.rope.get_embed(shape=(H, W)).to(device)
+
+        # Register as a buffer so it moves with the module and Dynamo treats it as static
+        model.rope.register_buffer("_cached_embed", cached_embed, persistent=False)
+
+        def _patched_get_embed(self, shape=None):
+            return self._cached_embed
+
+        # Bind as a method on the instance, no closure over external state
+        import types
+        model.rope.get_embed = types.MethodType(_patched_get_embed, model.rope)
+
+
     if config["fast_settings"]:
         torch.set_float32_matmul_precision('high') # TODO lower precision?
         torch.backends.cuda.matmul.allow_tf32 = True # just to be safe on older systems
         torch.backends.cudnn.allow_tf32 = True # optimizes for cuDNN convolutions #TODO makes it slower?
-        model = torch.compile(model, mode="reduce-overhead", dynamic=False)
+        if config["score_type"] != "layerwise":
+            model = torch.compile(model, mode="reduce-overhead", dynamic=False)
         torch.set_grad_enabled(True)
         print("Fast mode activated.")
     else:
@@ -93,15 +126,30 @@ def main(args):
 
     # ----- 3. Create dataset & dataloader -----
 
+    # load calibration dataset, if needed
+    cal_emb_mat, cal_scores = None, None
+    if config["score_type"] == "local_last_layer":
+        cal_path = Path(config["cal_set_path"])
+        if not cal_path.exists():
+            raise FileNotFoundError(
+                f"Calibration set not found at {cal_path}. "
+                f"Run the pipeline with score_type='last_layer' on your calibration "
+                f"dataset (e.g. Imagenet_val) first to produce it."
+            )
+        cal_emb_mat, cal_scores = load_calibration_set(cal_path, device=device)
+
+
     # 3.1 Checks if data folder is valid
 
     dataset = config["dataset"]
     dataset_path = DATASET_PATHS[dataset]
     
-    if dataset == "Imagenet_val":
+    if dataset == "Imagenet_val_5k":
         filenames_labels = create_pd_data_paths(dataset_path, dataset)
-    elif dataset in set(DATASET_PATHS.keys()) - {"Imagenet_val"}:
+    elif dataset in set(DATASET_PATHS.keys()) - {"Imagenet_val", "New-Generator"}:
         filenames_labels = create_pd_data_paths_recursive(dataset_path, dataset)
+    elif dataset == "New-Generator":
+        filenames_labels = create_pd_data_paths_New_Generators(dataset_path, dataset)
     else:
         raise ValueError(
             f"Unknown data folder '{dataset}'.\n"
@@ -141,13 +189,17 @@ def main(args):
                 config["batch_size"])
 
     # Build the profiler once, outside the loop
+    def trace_handler(prof):
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+        #torch.profiler.tensorboard_trace_handler("./tb_logs")(prof)
+
     if config["profiler"]:
         profiler_ctx = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU,
                         torch.profiler.ProfilerActivity.CUDA],
             schedule=torch.profiler.schedule(wait=0, warmup=5, active=3, repeat=1), # records batch 6,7,8
-            on_trace_ready=torch.profiler.tensorboard_trace_handler("./tb_logs"),
-            record_shapes=True,
+            on_trace_ready=trace_handler,
+            record_shapes=False, # if True OOM for profiler
         )
     else:
         profiler_ctx = nullcontext()
@@ -161,17 +213,20 @@ def main(args):
         for i, (img, label, img_path) in tqdm(enumerate(data_loader), total=len(data_loader), desc="Computing JEPA scores"):
             img = img.to(device).requires_grad_(True)
 
-            batch_results = score_fn(
-                model,
-                img,
-                config["vectorize"],
-                eps,
-                config["fast_settings"],
-                label,
-                dataset_path,
-                dataset,
-                img_path,
-            )
+            if config["score_type"] == "local_last_layer":
+                batch_results = score_fn(
+                    model, img, config["vectorize"], eps, config["fast_settings"],
+                    label, dataset_path, dataset, img_path,
+                    cal_emb_mat=cal_emb_mat,
+                    cal_scores=cal_scores,
+                    k=config["k_neighbors"],
+                )
+            else:
+                batch_results = score_fn(
+                    model, img, device, eps,
+                    label, dataset_path, dataset, img_path,
+                    config,
+                )
 
             batch_results.to_json(
                 full_output_path,
@@ -183,7 +238,9 @@ def main(args):
             if config["profiler"]:
                 prof.step()
     # TODO make it work for layer-wise
-    calculate_metrics(full_output_path, dataset)
+    if dataset != "Imagenet_val_5k" and config["score_type"] != "layerwise":
+        calculate_metrics(full_output_path, dataset)
+    else: print("No metrics calculated. Calibration set has no fakes. / Layerwise aggregation not yet implemented for final evaluation.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

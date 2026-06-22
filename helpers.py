@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from torch.utils.data import DataLoader, Dataset
 from torch.autograd.functional import jacobian
+from torch.func import jacrev
 from PIL import Image
 import timm
 import os
@@ -39,6 +40,32 @@ def load_model(device: str = "cuda", model_name: str = "") -> Tuple[torch.nn.Mod
     model = model.to(device)
 
     return model
+
+def create_pd_data_paths_New_Generators(dataset_folder_path: str, folder_name: str) -> pd.DataFrame:
+
+    base_dir = os.path.join(dataset_folder_path, folder_name)
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
+
+    paths = []
+    labels = []
+    
+    for generator in os.listdir(base_dir):
+        generator_path = os.path.join(base_dir, generator)
+        if not os.path.isdir(generator_path):
+            continue  # skip any stray files in base_dir
+        label = 0.0 if generator == "real" else 1.0
+        for file in os.listdir(generator_path):
+            if Path(file).suffix.lower() in image_extensions:
+                rel_path = os.path.join(generator, file)
+                paths.append(rel_path)
+                labels.append(label)
+    
+    paths_labels = pd.DataFrame({
+        "img_path": paths,
+        "label": labels
+    })
+    
+    return paths_labels
 
 def create_pd_data_paths_recursive(dataset_folder_path: str, folder_name: str) -> pd.DataFrame:
     """
@@ -95,12 +122,7 @@ def create_pd_data_paths(dataset_folder_path: str, folder_name: str) -> pd.DataF
 
     paths_labels = pd.DataFrame({
         "img_path": dir_list_test,
-        "label": [
-            float(0) if name.startswith("0_real") # only works for "all" & "MS_COCO_val2017"
-            else float(1) if name.startswith("1_fake")
-            else None
-            for name in dir_list_test
-        ]
+        "label": [float(0) for _ in dir_list_test]
     })
 
     return paths_labels
@@ -163,7 +185,6 @@ def resume_or_create_dataset_dataloader(
 
     return data_loader
 
-
 def resume_or_create_dataset_dataloader_json(
         output_path: Path,
         filenames_labels: pd.DataFrame,
@@ -210,10 +231,12 @@ def resume_or_create_dataset_dataloader_json(
     )
     print(f"Batch size of dataloader: {batch_size}")
     return data_loader
-
-def score_last_layer(model, img, vectorize, eps, enabled, label, dataset_path, dataset, img_path) -> pd.DataFrame:
+                
+def score_last_layer(model, img, device, eps, label, dataset_path, dataset, img_path, config) -> pd.DataFrame:
     """
-    Calculates singular value spectrum and final JEPA-SCORE based ∂f(x) / ∂x.
+    Calculates singular value spectrum, JEPA-SCORE, AND embedding based on ∂f(x) / ∂x.
+    The embedding is saved so the resulting JSONL can serve as a calibration set
+    for conditional (local z-score) scoring at test time.
     Args:
         model: pretrained backbone.
         img: batch of input images [B, C, H, W].
@@ -225,22 +248,390 @@ def score_last_layer(model, img, vectorize, eps, enabled, label, dataset_path, d
         dataset: dataset name.
         img_path: full directory path of image.
     Returns:
-        batch results: pandas DataFrame with label, score, img_path and singular values spectrum for each image in batch.
+        batch results: pandas DataFrame with label, score, img_path, singular values spectrum and embedding for each image in batch.
     """
-    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=enabled):
-        J = jacobian(lambda x: model(x).sum(0), inputs=img, vectorize=vectorize)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=config["fast_settings"]):
+        with torch.no_grad():
+            emb = model(img)  # [B, D]
+        J = jacobian(lambda x: model(x).sum(0), inputs=img, vectorize=config["vectorize"])
+ 
     with torch.inference_mode():
-        J = J.flatten(2).permute(1, 0, 2).float() # .float() decouples SVD precision from autocast
-        svdvals = torch.linalg.svdvals(J) # D: size of embedding dimension
-        jepa_score = svdvals.clip_(eps).log_().sum(1)
-    
+        J = J.flatten(2).permute(1, 0, 2).float()
+        svdvals = torch.linalg.svdvals(J)
+        log_sv = svdvals.clamp(min=eps).log()
+        jepa_score = log_sv.sum(1) # [B]
+ 
     batch_results = pd.DataFrame({
-                "label": label.cpu().tolist(),
-                "score": jepa_score.cpu().tolist(),
-                "img_path": [x.removeprefix(dataset_path + dataset + "/") for x in img_path],
-                "svdvals": svdvals.cpu().tolist(),
-            })
+        "label": label.cpu().tolist(),
+        "score": jepa_score.cpu().tolist(),
+        "img_path": [x.removeprefix(dataset_path + dataset + "/") for x in img_path],
+        "svdvals": svdvals.cpu().tolist(),
+        "embedding": emb.float().cpu().tolist(),
+    })
     return batch_results
+
+def load_calibration_set(cal_set_path: Path, device: str = "cuda"):
+    """
+    Loads a calibration JSONL produced by score_last_layer and returns:
+      - emb_mat:  [N_cal, D] tensor of L2-normalized embeddings (for cosine sim)
+      - scores:   [N_cal]    tensor of raw scalar scores (JEPA-SCOREs)
+    Called once at startup; result is held in memory and passed to the scorer.
+    """
+    with open(cal_set_path, "r") as f:
+        next(f)  # skip metadata header line
+        df = pd.read_json(f, lines=True)
+ 
+    emb_mat = torch.tensor(df["embedding"].tolist(), dtype=torch.float32, device=device)
+    emb_mat = torch.nn.functional.normalize(emb_mat, dim=1)  # pre-normalize once
+    scores = torch.tensor(df["score"].tolist(), dtype=torch.float32, device=device)
+ 
+    print(f"Loaded calibration set: {emb_mat.shape[0]} images, embedding dim {emb_mat.shape[1]}")
+    return emb_mat, scores
+
+def conditional_score_last_layer(
+    model, img, vectorize, eps, enabled, label, dataset_path, dataset, img_path,
+    cal_emb_mat: torch.Tensor,   # [N_cal, D], pre-normalized
+    cal_scores: torch.Tensor,    # [N_cal]
+    k: int = 100,
+) -> pd.DataFrame:
+    """
+    Computes the raw scalar score s(x) = sum(log svdvals) AND a conditional
+    z-score against the k nearest calibration images (cosine sim in embedding space).
+ 
+    Conditional z-score:
+        z(x) = (s(x) - mean_kNN) / std_kNN
+ 
+    Lower z (negative, large magnitude) means the encoder responds with less
+    spectral mass than usual for similar real images -- a candidate fake signature.
+    Sign convention here is "raw minus mean", same as a standard z-score; flip if you
+    have a directional hypothesis.
+    """
+
+    #TODO implement hook to skip "duplicate" forward pass
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=enabled):
+        with torch.no_grad():
+            emb = model(img)  # [B, D]
+        J = jacobian(lambda x: model(x).sum(0), inputs=img, vectorize=vectorize)
+ 
+    with torch.inference_mode():
+        J = J.flatten(2).permute(1, 0, 2).float()
+        svdvals = torch.linalg.svdvals(J)
+        log_sv = svdvals.clamp(min=eps).log()
+        jepa_score = log_sv.sum(1) # [B]
+ 
+        # --- Conditional z-score against kNN in calibration set ---
+        emb_norm = torch.nn.functional.normalize(emb.float(), dim=1)  # [B, D]
+        sims = emb_norm @ cal_emb_mat.T                                # [B, N_cal]
+        topk = torch.topk(sims, k=k, dim=1, largest=True).indices      # [B, k]
+        neighbor_scores = cal_scores[topk]                             # [B, k]
+ 
+        local_mean = neighbor_scores.mean(dim=1)                       # [B]
+        local_std = neighbor_scores.std(dim=1).clamp_min(1e-8)         # [B], guard against zero
+        z_score = (jepa_score - local_mean) / local_std                 # [B]
+ 
+    batch_results = pd.DataFrame({
+        "label": label.cpu().tolist(),
+        "score": z_score.cpu().tolist(),              # primary score: conditional z
+        "raw_score": jepa_score.cpu().tolist(),        # unconditional, for comparison
+        "local_mean": local_mean.cpu().tolist(),      # diagnostic
+        "local_std": local_std.cpu().tolist(),        # diagnostic
+        "img_path": [x.removeprefix(dataset_path + dataset + "/") for x in img_path],
+        "svdvals": svdvals.cpu().tolist(),
+    })
+    return batch_results
+
+""" def score_all_layers(model, img, vectorize, device, eps, enabled, label, dataset_path, dataset, img_path) -> pd.DataFrame:
+    # vectorize/enabled is never used. only included to make score calculation less cluttered
+    B, C, H, W = img.shape
+    num_layers = len(model.blocks)
+    D = model.embed_dim
+    I_D = torch.eye(D, device=device).unsqueeze(1)   # [D, 1, D]
+    num_outputs = num_layers + 1                     # blocks + final post-norm feature
+    layer_scores = {l: [] for l in range(num_outputs)}
+
+    #print(model.num_prefix_tokens)  # should be 1 for standard CLS
+    #print(model.cls_token)          # should not be None
+    
+    # ── Forward: capture per-block CLS + final model output ──
+    cls_outs = []  # one [B, D] tensor per block
+    
+    def cls_hook(module, input, output):
+        if isinstance(output, tuple):
+            output = output[0]
+        cls_outs.append(output[:, 0])  # raw block output, no norm. output of each layer
+
+    handles = [b.register_forward_hook(cls_hook) for b in model.blocks]
+    try:
+        feat = model(img)  # post-final-norm, equals model.norm(last_block_out[:,0])
+    finally:
+        for h in handles:
+            h.remove()
+
+    cls_outs.append(feat)  # final entry: paper-exact JEPA-SCORE
+    #embeddings = torch.stack(cls_outs, dim=0).squeeze(1)
+
+    # ── Backward: per-layer Jacobian via batched VJPs ─────────
+    J = torch.empty(num_outputs, D, C, H, W, device=device)
+    
+    # only works for batch size of 1
+    for l in range(num_outputs):
+        grads = torch.autograd.grad(
+            outputs=cls_outs[l],
+            inputs=img,
+            grad_outputs=I_D,                        # [D, 1, D] one-hots
+            is_grads_batched=True,
+            retain_graph=(l < num_outputs - 1),
+        )[0]                                         # [D, 1, C, H, W]
+        J[l] = grads.squeeze(1)
+        
+    # ── SVD-based score per layer ─────────────────────────────
+    J_flat = J.reshape(num_outputs, D, -1).float()   # [L+1, D, C*H*W]
+    svdvals = torch.linalg.svdvals(J_flat)           # [L+1, D]
+    scores = svdvals.clamp_min(eps).log().sum(dim=1) # [L+1]    
+    
+    for l in range(num_outputs):
+        layer_scores[l].append(scores[l])
+    layer_scores = {l: torch.stack(v) for l, v in layer_scores.items()}
+
+    # save labels, JEPA-SCOREs and image filenames in csv file
+    batch_results = pd.DataFrame({
+    "label": label.cpu().tolist(),
+    **{f"layer_{l}": layer_scores[l].cpu().tolist() for l in range(num_outputs - 1)},
+    "layer_norm": layer_scores[num_outputs - 1].cpu().tolist(),
+    "img_path": [x.removeprefix(dataset_path + dataset + "/") for x in img_path]
+    })
+
+    return batch_results """
+
+def score_all_layers(model, img, device, eps, label, dataset_path, dataset, img_path, config) -> pd.DataFrame:
+    # vectorize/enabled is never used. only included to make score calculation less cluttered
+
+    # ── Define layers to compute scores for ───────────────────────────────────
+    num_layers  = len(model.blocks)
+    num_outputs = num_layers + 1      # num_outputs - 1 is the post-norm layer
+    layers = config["layers"] # all layers; edit to e.g. [0, 4, 8, num_layers]
+
+    B, C, H, W = img.shape
+    D          = model.embed_dim
+    I_D        = torch.eye(D, device=device).unsqueeze(1).bfloat16()   # [D, 1, D]
+
+    assert all(0 <= l < num_outputs for l in layers), \
+        f"Layer indices must be in [0, {num_outputs - 1}]. {num_outputs - 1} is the post-norm layer."
+
+    # ── Forward: capture per-block CLS + final model output ───────────────────
+    cls_outs = {}  # keyed by layer index
+
+    def cls_hook(module, input, output):
+        idx = list(model.blocks).index(module)
+        if idx in layers:
+            if isinstance(output, tuple):
+                output = output[0]
+            cls_outs[idx] = output[:, 0]  # raw block output, no norm
+
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=config["fast_settings"]):
+        handles = [b.register_forward_hook(cls_hook) for b in model.blocks]
+        try:
+            feat = model(img)  # post-final-norm, equals model.norm(last_block_out[:,0])
+        finally:
+            for h in handles:
+                h.remove()
+
+        if (num_outputs - 1) in layers:
+            cls_outs[num_outputs - 1] = feat  # final entry: paper-exact JEPA-SCORE
+
+        # ── Backward: per-layer Jacobian via batched VJPs ─────────────────────────
+        J = torch.empty(len(layers), D, C, H, W, device=device, dtype=torch.bfloat16)
+
+        for i, l in enumerate(layers):
+            grads = torch.autograd.grad(
+                outputs=cls_outs[l],
+                inputs=img,
+                grad_outputs=I_D,                        # [D, 1, D] one-hots
+                is_grads_batched=True,
+                retain_graph=(i < len(layers) - 1),
+            )[0]                                         # [D, 1, C, H, W]
+            J[i] = grads.squeeze(1)
+
+    # ── SVD-based score per layer ──────────────────────────────────────────────
+    J_flat  = J.reshape(len(layers), D, -1).float() # [len(layers), D, C*H*W]
+    svdvals = torch.linalg.svdvals(J_flat)           # [len(layers), D]
+    scores  = svdvals.clamp_min(eps).log().sum(dim=1) # [len(layers)]
+
+    # ── DataFrame ─────────────────────────────────────────────────────────────
+    layer_cols = {}
+    for i, l in enumerate(layers):
+        col = "layer_norm" if l == num_outputs - 1 else f"layer_{l}"
+        layer_cols[col] = [scores[i].item()]
+
+    batch_results = pd.DataFrame({
+        "label"   : label.cpu().tolist(),
+        **layer_cols,
+        "img_path": [x.removeprefix(dataset_path + dataset + "/") for x in img_path],
+    })
+    return batch_results
+
+# ── Module-level cache ─────────────────────────────────────────────────────────
+# Prevents recompilation on every call to score_all_layers.
+# Key: (model_id, layers_set, chunk_size, fast_settings)
+_J_FN_CACHE: dict = {}
+
+
+def _make_forward_fn(model, layers_set: frozenset, num_outputs: int):
+    """
+    Factory for a single-image forward function.
+
+    Defined at module level (not inside score_all_layers) so torch.compile
+    always sees the same stable callable — if it were a local function,
+    Python would create a new object each call and trigger recompilation.
+
+    Returns stacked CLS tokens [len(layers), D] for selected layers.
+    Intermediate layers are pre-norm (raw block output).
+    Final layer (num_outputs-1) is post-norm (paper-exact JEPA-SCORE).
+    """
+    # Unwrap compiled model if jepa_score.py already compiled it.
+    # We need access to submodules directly for the manual forward.
+    base_model = getattr(model, '_orig_mod', model)
+
+    def forward_single(img_single: torch.Tensor) -> torch.Tensor:
+        """
+        img_single : [C, H, W]   — single image, no batch dim
+        returns    : [L, D]      — stacked CLS tokens for selected layers
+        """
+        x = base_model.patch_embed(img_single.unsqueeze(0))
+        x = base_model._pos_embed(x)   # handles CLS token, registers, pos embed
+        x = base_model.patch_drop(x)   # no-op at eval
+        x = base_model.norm_pre(x)     # usually Identity, but needed for correctness
+
+        cls_list = []
+        for i, block in enumerate(base_model.blocks):
+            x = block(x)               # RoPE (DINOv3) is applied inside block
+            if i in layers_set:
+                cls_list.append(x[0, 0])   # CLS token, pre-norm
+
+        x = base_model.norm(x)
+        if (num_outputs - 1) in layers_set:
+            cls_list.append(x[0, 0])   # post-norm, paper-exact JEPA-SCORE layer
+
+        return torch.stack(cls_list)   # [L, D]
+
+    return forward_single
+
+
+def score_all_layers_fast(
+    model, img, device, eps,
+    label, dataset_path, dataset, img_path,
+    config,
+) -> pd.DataFrame:
+    """
+    Computes JEPA-SCORE for each selected layer using jacrev + CUDA graphs.
+
+    Replaces the autograd.grad loop with torch.func.jacrev, which:
+    - Expresses the Jacobian as a pure function torch.compile can trace
+    - Enables CUDA graphs via mode="reduce-overhead"
+    - Uses chunk_size to control memory vs speed tradeoff
+
+    chunk_size tuning:
+        chunk_size = D (e.g. 768 for ViT-B):
+            Same number of backward passes as the old autograd.grad approach.
+            Good default — compilable with no regression.
+        chunk_size < D:
+            More passes, less peak VRAM. Use if you OOM.
+        chunk_size > D (up to L*D):
+            Fewer passes, more peak VRAM. Use if you have headroom.
+        chunk_size = None:
+            Single giant vmap — fastest but almost certainly OOMs.
+
+    First call is slow (compilation + CUDA graph recording).
+    With your profiler schedule (wait=0, warmup=5, active=3), compilation
+    happens during warmup batches, so the profiler window captures the fast path.
+
+    Config keys used:
+        layers        : list of layer indices to score
+        fast_settings : bool — enables compile + bfloat16
+        chunk_size    : int  — jacrev chunk size (default: model.embed_dim)
+    """
+
+    num_layers  = len(model.blocks)
+    num_outputs = num_layers + 1
+    layers      = config["layers"]
+    layers_set  = frozenset(layers)
+    fast        = config["fast_settings"]
+
+    # Default chunk_size = D: same pass count as old autograd.grad approach
+    # but now compilable. Override in config to tune memory.
+    D          = model.embed_dim
+    chunk_size = config.get("chunk_size", D)
+
+    B, C, H, W = img.shape
+    L          = len(layers)
+
+    assert all(0 <= l < num_outputs for l in layers), \
+        f"Layer indices must be in [0, {num_outputs - 1}]. " \
+        f"{num_outputs - 1} is the post-norm layer."
+
+    # ── Build / retrieve compiled Jacobian function ────────────────────────────
+    base_model = getattr(model, '_orig_mod', model)
+    cache_key  = (id(base_model), layers_set, chunk_size, fast)
+
+    if cache_key not in _J_FN_CACHE:
+        if fast:
+            base_model.bfloat16()  # convolution_backward requires matching dtypes for input and weight
+
+        fwd_fn = _make_forward_fn(model, layers_set, num_outputs)
+
+        # Apply jacrev BEFORE torch.compile so Dynamo traces through both
+        # the jacrev machinery AND the forward in one shot.
+        # This lets CUDA graphs capture the full Jacobian computation,
+        # not just the forward pass.
+        J_fn = jacrev(fwd_fn, chunk_size=chunk_size)
+
+        if fast:
+            # reduce-overhead records a CUDA graph on the first call
+            # and replays it on all subsequent calls.
+            # dynamic=False: fixed shapes required (same img size every call).
+            J_fn = torch.compile(J_fn, mode="reduce-overhead", dynamic=False)
+
+        _J_FN_CACHE[cache_key] = J_fn
+
+    J_fn = _J_FN_CACHE[cache_key]
+
+    # ── Compute Jacobian ───────────────────────────────────────────────────────
+    # jacrev manages its own gradient tracking internally.
+    # Detach from the outer autograd graph to avoid interference.
+    #
+    # bfloat16 input: halves Jacobian memory during computation.
+    # The dtype propagates through ops (weights are float32, so mixed precision
+    # applies where supported). SVD is always done in float32 after casting.
+    img_input = img.detach().bfloat16() if fast else img.detach()
+    out_dtype  = torch.bfloat16 if fast else torch.float32
+
+    J = torch.empty(B, L, D, C, H, W, device=device, dtype=out_dtype)
+
+    for b in range(B):
+        # J_fn: [C, H, W] → [L, D, C, H, W]
+        # First call: slow (compilation + CUDA graph recording ~30-60s)
+        # All subsequent calls: fast (CUDA graph replay)
+        J[b] = J_fn(img_input[b])
+
+    # ── SVD ────────────────────────────────────────────────────────────────────
+    # Reshape to [B*L, D, C*H*W], cast to float32, force contiguous layout.
+    # .contiguous() pays one copy upfront instead of triggering hidden copies
+    # inside svdvals (which requires contiguous memory).
+    J_flat  = J.reshape(B * L, D, C * H * W).float().contiguous()  # [B*L, D, C*H*W]
+    svdvals = torch.linalg.svdvals(J_flat)                          # [B*L, D]
+    scores  = svdvals.clamp_min(eps).log().sum(dim=1).reshape(B, L) # [B, L]
+
+    # ── DataFrame ──────────────────────────────────────────────────────────────
+    layer_cols = {}
+    for i, l in enumerate(layers):
+        col = "layer_norm" if l == num_outputs - 1 else f"layer_{l}"
+        layer_cols[col] = scores[:, i].cpu().tolist()
+
+    return pd.DataFrame({
+        "label"   : label.cpu().tolist(),
+        **layer_cols,
+        "img_path": [p.removeprefix(dataset_path + dataset + "/") for p in img_path],
+    })
 
 def calculate_metrics(full_output_path, dataset) -> None:
     """
@@ -255,6 +646,7 @@ def calculate_metrics(full_output_path, dataset) -> None:
 
     CLASSES = {
         "ForenSynths": ["biggan", "crn", "cyclegan", "deepfake", "gaugan", "imle", "progan", "san", "seeingdark", "stargan", "stylegan", "stylegan2", "whichfaceisreal"],
+        "ForenSynths_val": ["ForenSynths_val"],
         "NewGenerators": None, #TODO
         "GenImage": None, #TODO
     }
@@ -275,6 +667,7 @@ def calculate_metrics(full_output_path, dataset) -> None:
     overall_auc = roc_auc_score(df.label, df.score)
     overall_ap = average_precision_score(df.label, df.score)
     macro_auc, macro_ap = mean(AUCs), mean(APs)
+    #TODO implement for GANs only
     weighted_auc = sum(a * n for a, n in zip(AUCs, counts)) / total
     weighted_ap  = sum(a * n for a, n in zip(APs,  counts)) / total
 

@@ -1,0 +1,18 @@
+# Out-of-sample test 1: RAISE1k (dalle3 / firefly / midjourney-v5, RAW-photo reals).
+# Settings frozen from the COCO17 discovery run -- do not tune.
+# Direction discovered there: fakes have LOWER orbit dispersion (sub-50 AUC = inverted).
+
+model_name: "vit_base_patch16_dinov3.lvd1689m"
+fast_settings: True
+dataset: "New-Generator_RAISE1k_unbiased"
+batch_size: 1          # orbit occupies the batch dimension
+profiler: False
+
+vectorize: False
+score_type: "orbit"
+
+# orbit settings -- identical to the COCO17 run
+m_views: 12
+orbit_seed: 0
+global_crops_scale: [0.32, 1.0]
+subset_per_class: 100  # 4 groups (real + 3 generators) -> 400 images

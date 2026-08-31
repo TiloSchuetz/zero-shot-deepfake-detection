@@ -1,0 +1,12 @@
+# This file contains test experiment settings
+
+model_name: "vit_large_patch14_clip_quickgelu_224.metaclip_400m"
+fast_settings: True
+dataset: "ForenSynths_val"
+batch_size: 1
+profiler: False
+
+# jepa score calc settings
+vectorize: False
+score_type: "layerwise"
+layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 , 24]

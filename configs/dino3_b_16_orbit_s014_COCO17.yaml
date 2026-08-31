@@ -1,0 +1,17 @@
+# Phase 0: orbit smoke test. Small model (ViT-B/16, D=768) for fast iteration.
+# global_crops_scale 0.14-1.0 : pretrain stage (sensitivity check)
+
+model_name: "vit_base_patch16_dinov3.lvd1689m"
+fast_settings: False
+dataset: "New-Generator_COCO17_unbiased"
+batch_size: 1          # orbit occupies the batch dimension
+profiler: False
+
+vectorize: False
+score_type: "orbit"
+
+# orbit settings
+m_views: 12            # t1/t2 interleaved by parity -> m=4,8 recoverable post-hoc
+orbit_seed: 0
+global_crops_scale: [0.14, 1.0]
+subset_per_class: 100  # raise to 500 for phase 1

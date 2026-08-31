@@ -1,0 +1,11 @@
+# This file contains test experiment settings
+
+model_name: "vit_large_patch14_clip_quickgelu_224.metaclip_400m"
+fast_settings: True
+dataset: "New-Generator"
+batch_size: 8 # max is around 8 for cuda graphs and 48gb VRAM
+profiler: False
+
+# jepa score calc settings
+vectorize: False
+score_type: "last_layer_spectral"

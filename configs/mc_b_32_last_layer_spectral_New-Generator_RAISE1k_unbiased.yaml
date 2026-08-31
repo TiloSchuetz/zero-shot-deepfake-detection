@@ -1,0 +1,15 @@
+# This file contains test experiment settings
+
+model_name: "vit_base_patch32_clip_quickgelu_224.metaclip_400m"
+fast_settings: False # bf16 noise lands in the high-frequency bins; validate in fp32 first
+dataset: "New-Generator_RAISE1k_unbiased"
+batch_size: 32 # max is around 8 for cuda graphs and 48gb VRAM
+profiler: False
+
+# jepa score calc settings
+vectorize: False
+score_type: "last_layer_spectral"
+
+# jacobian frequency profile
+freq_profile: True
+freq_bins: 32

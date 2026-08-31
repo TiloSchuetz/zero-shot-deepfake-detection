@@ -1,0 +1,12 @@
+# This file contains test experiment settings
+
+model_name: "vit_large_patch16_dinov3.lvd1689m"
+fast_settings: True
+dataset: "Imagenet_val_5k"
+batch_size: 1
+profiler: False
+
+# jepa score calc settings
+vectorize: False
+score_type: "layerwise"
+layers: [8, 19, 24]

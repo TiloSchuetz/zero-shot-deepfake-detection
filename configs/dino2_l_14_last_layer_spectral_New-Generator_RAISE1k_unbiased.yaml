@@ -1,12 +1,11 @@
 # This file contains test experiment settings
 
-model_name: "vit_large_patch14_clip_224.openai"
+model_name: "vit_large_patch14_dinov2.lvd142m"
 fast_settings: True
-dataset: "New-Generator"
+dataset: "New-Generator_RAISE1k_unbiased"
 batch_size: 1
 profiler: False
 
 # jepa score calc settings
 vectorize: False
-score_type: "layerwise"
-layers: [12, 16, 18, 24]
+score_type: "last_layer_spectral"

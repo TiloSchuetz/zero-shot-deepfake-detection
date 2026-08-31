@@ -1,0 +1,22 @@
+# Out-of-sample test 2: ForenSynths (7 GANs, matched real/fake resolution at 384px).
+# Settings frozen from the COCO17 discovery run -- do not tune.
+# Direction discovered there: fakes have LOWER orbit dispersion (sub-50 AUC = inverted).
+#
+# NOTE: subset_per_class groups on (generator, label) here, because ForenSynths nests
+# both classes under one generator (stylegan/car/{0_real,1_fake}).
+# 7 generators x 2 labels x 100 = 1400 images (~5 h at ~12.5 s/image).
+
+model_name: "vit_base_patch16_dinov3.lvd1689m"
+fast_settings: True
+dataset: "ForenSynths"
+batch_size: 1
+profiler: False
+
+vectorize: False
+score_type: "orbit"
+
+# orbit settings -- identical to the COCO17 run
+m_views: 12
+orbit_seed: 0
+global_crops_scale: [0.32, 1.0]
+subset_per_class: 100

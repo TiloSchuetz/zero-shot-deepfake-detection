@@ -1,11 +1,11 @@
-model_name: "vit_base_patch32_clip_224.openai"
+model_name: "vit_base_patch32_clip_quickgelu_224.openai"
 fast_settings: false
 dataset: "Imagenet_val_5k"
 batch_size: 32
 profiler: False
 
 vectorize: False
-score_type: "last_layer"    # produces JSONL with embeddings (for the kNN bank)
+score_type: "last_layer_spectral"    # produces JSONL with embeddings (for the kNN bank)
 
 cal_set_path: null        # not used for this run
 k_neighbors: null         # not used for this run

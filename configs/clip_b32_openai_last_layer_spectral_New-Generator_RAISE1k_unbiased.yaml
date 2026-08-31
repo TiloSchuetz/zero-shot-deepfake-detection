@@ -1,9 +1,9 @@
 # This file contains test experiment settings
 
 model_name: "vit_base_patch32_clip_quickgelu_224.openai"
-fast_settings: True
-dataset: "ForenSynths"
-batch_size: 1
+fast_settings: False
+dataset: "New-Generator_RAISE1k_unbiased"
+batch_size: 8
 profiler: False
 
 # jepa score calc settings

@@ -1,6 +1,6 @@
 # This file contains test experiment settings
 
-model_name: "vit_large_patch14_clip_224.openai"
+model_name: "vit_large_patch14_clip_quickgelu_224.openai"
 fast_settings: True
 dataset: "Imagenet_val_5k"
 batch_size: 1
@@ -9,4 +9,4 @@ profiler: False
 # jepa score calc settings
 vectorize: False
 score_type: "layerwise"
-layers: [12, 16, 18, 24]
+layers: [12, 18, 24]

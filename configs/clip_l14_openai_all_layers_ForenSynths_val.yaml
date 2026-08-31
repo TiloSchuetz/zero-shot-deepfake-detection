@@ -1,6 +1,6 @@
 # This file contains test experiment settings
 
-model_name: "vit_large_patch14_clip_224.openai"
+model_name: "vit_large_patch14_clip_quickgelu_224.openai"
 fast_settings: True
 dataset: "ForenSynths_val"
 batch_size: 1

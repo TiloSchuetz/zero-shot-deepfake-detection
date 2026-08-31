@@ -10,7 +10,7 @@ import torch
 from typing import Tuple
 from pathlib import Path
 import json
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score, f1_score
 from statistics import mean
 
 
@@ -31,6 +31,90 @@ class CustomImageDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         return image, label, img_path
+
+class OrbitImageDataset(Dataset):
+    """
+    Returns an augmentation orbit per image: [1 + m, C, H, W].
+
+    View 0 is the deterministic reference (timm eval transform). Views 1..m
+    alternate between DINOv3's global_transfo1 (even i) and global_transfo2
+    (odd i), so any even-length prefix stays balanced across the two
+    sub-recipes -- this is what makes the post-hoc m-ablation valid.
+
+    Augmentation runs on CPU in the dataloader worker on purpose: GPU-side RNG
+    inside a captured CUDA graph would be frozen at capture time and every image
+    would receive identical augmentations.
+    """
+
+    def __init__(self, annotations_file: pd.DataFrame, dataset_folder_path: str, img_dir: str,
+                 t0, t1, t2, m: int = 12, seed: int = 0):
+        self.img_labels = annotations_file
+        self.dataset_folder_path = dataset_folder_path
+        self.img_dir = dataset_folder_path + img_dir
+        self.t0, self.t1, self.t2 = t0, t1, t2
+        self.m = m
+        self.seed = seed
+
+    def __len__(self):
+        return len(self.img_labels)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.img_labels.iloc[idx, 0])
+        image = Image.open(img_path).convert("RGB")
+        label = self.img_labels.iloc[idx, 1]
+
+        # seed from the item index, not the global RNG: reproducible and
+        # independent of num_workers / batch order.
+        torch.manual_seed(self.seed * 1_000_003 + idx)
+
+        views = [self.t0(image)]
+        for i in range(self.m):
+            views.append((self.t1 if i % 2 == 0 else self.t2)(image))
+
+        return torch.stack(views), label, img_path
+
+
+def resume_or_create_orbit_dataloader_json(
+        output_path: Path,
+        filenames_labels: pd.DataFrame,
+        dataset_folder_path: str,
+        data_folder: str,
+        t0, t1, t2,
+        m: int,
+        seed: int,
+        ) -> DataLoader:
+    """
+    Orbit counterpart of resume_or_create_dataset_dataloader_json.
+
+    batch_size is always 1: the orbit itself occupies the batch dimension, which
+    keeps the compiled model's input shape fixed at [1+m, C, H, W] for every
+    single step and avoids CUDA graph re-capture entirely.
+    """
+    assert output_path.exists(), f"Expected {output_path} to exist with metadata header."
+
+    with open(output_path, "r") as f:
+        next(f)
+        already_done = {json.loads(line)["img_path"] for line in f if line.strip()}
+
+    if already_done:
+        print(f"Resuming: {len(already_done)} orbits already computed.")
+    else:
+        print("Starting fresh run.")
+
+    resumed_df = filenames_labels[~filenames_labels['img_path'].isin(already_done)]
+    test_dataset = OrbitImageDataset(resumed_df, dataset_folder_path, data_folder,
+                                     t0, t1, t2, m=m, seed=seed)
+
+    data_loader = DataLoader(
+        dataset=test_dataset,
+        batch_size=1,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=4,
+    )
+    print(f"Orbit dataloader: {len(test_dataset)} images, m={m} augmented views (+1 reference)")
+    return data_loader
+
 
 def load_model(device: str = "cuda", model_name: str = "") -> Tuple[torch.nn.Module, callable]:
     """Loads JEPA encoder model"""
@@ -251,8 +335,8 @@ def score_last_layer(model, img, device, eps, label, dataset_path, dataset, img_
         batch results: pandas DataFrame with label, score, img_path, singular values spectrum and embedding for each image in batch.
     """
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=config["fast_settings"]):
-        with torch.no_grad():
-            emb = model(img)  # [B, D]
+        #with torch.no_grad():
+            #emb = model(img)  # [B, D]
         J = jacobian(lambda x: model(x).sum(0), inputs=img, vectorize=config["vectorize"])
  
     with torch.inference_mode():
@@ -266,9 +350,101 @@ def score_last_layer(model, img, device, eps, label, dataset_path, dataset, img_
         "score": jepa_score.cpu().tolist(),
         "img_path": [x.removeprefix(dataset_path + dataset + "/") for x in img_path],
         "svdvals": svdvals.cpu().tolist(),
-        "embedding": emb.float().cpu().tolist(),
+        #"embedding": emb.float().cpu().tolist(),
     })
     return batch_results
+
+def _cv(t: torch.Tensor) -> float:
+    """Scale-free dispersion: std / |mean|. Sample std (ddof=1) throughout, so the
+    post-hoc m-ablation compares like with like."""
+    return (t.std(unbiased=True) / t.mean().abs()).item()
+
+
+def score_orbit(model, views, device, eps, label, dataset_path, dataset, img_path, config) -> pd.DataFrame:
+    """
+    Orbit-relative scoring. One pass over an image's augmentation orbit yields
+    three feature families that share the same views and the same forward pass:
+
+      1. JEPA orbit   -- dispersion of the Jacobian logdet across the orbit.
+                         Costs D backward passes per view (the expensive one).
+      2. Gram orbit   -- dispersion of the patch-feature Gram spectrum.
+                         Forward-only, ~D x cheaper. Uses the Gram EIGENVALUES,
+                         which are invariant to patch permutation, so it remains
+                         valid under crops and flips.
+      3. Drift        -- mean embedding displacement over the orbit. The
+                         noise-stability baseline that 1. and 2. must beat.
+
+    Pre-registered direction (never calibrated per dataset): fakes are predicted
+    to have HIGHER dispersion, because the encoder's invariance was trained on
+    pretraining-like images and fakes inherit it only by generalization.
+
+    Args:
+        views: [1+m, C, H, W] -- view 0 is the deterministic reference.
+    Returns:
+        Single-row DataFrame of scalar features plus the per-view score vectors.
+    """
+    feat_model = getattr(model, "_orig_mod", model)   # unwrap torch.compile
+    n_prefix = getattr(feat_model, "num_prefix_tokens", 1)  # CLS + register tokens
+
+    # --- forward-only features -------------------------------------------------
+    # Reduced to host scalars BEFORE the Jacobian: under mode="reduce-overhead"
+    # cudagraph outputs live in static buffers that later replays overwrite.
+    with torch.no_grad():
+        feats = feat_model.forward_features(views)          # [V, n_prefix + N, D]
+        emb = feat_model.forward_head(feats).float()        # [V, D]
+        drift = (emb[1:] - emb[0]).norm(dim=1).mean().item()
+
+        patches = feats[:, n_prefix:, :].float()            # [V, N, D]
+        patches = patches - patches.mean(dim=1, keepdim=True)
+        gram = patches @ patches.transpose(1, 2)            # [V, N, N]
+        gram_ev = torch.linalg.svdvals(gram)                # permutation-invariant
+        gram_logdet = gram_ev.clamp(min=eps).log().sum(-1)  # [V]
+        p = gram_ev / gram_ev.sum(-1, keepdim=True)
+        gram_erank = torch.exp(-(p * p.clamp(min=eps).log()).sum(-1))  # [V]
+
+    # --- Jacobian spectrum, unchanged from score_last_layer --------------------
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=config["fast_settings"]):
+        J = jacobian(lambda x: model(x).sum(0), inputs=views, vectorize=config["vectorize"])
+
+    with torch.inference_mode():
+        J = J.flatten(2).permute(1, 0, 2).float()           # [V, D, C*H*W]
+        svdvals = torch.linalg.svdvals(J)                   # [V, D]
+        assert bool((svdvals >= 0).all()), "expected raw (non-log) singular values"
+        jepa_per_view = svdvals.clamp(min=eps).log().sum(1)  # [V]
+
+    ref, orbit = jepa_per_view[0], jepa_per_view[1:]
+    gram_ref, gram_orbit = gram_logdet[0], gram_logdet[1:]
+
+    batch_results = pd.DataFrame([{
+        "label": float(label[0]) if hasattr(label, "__len__") else float(label),
+        "img_path": img_path[0].removeprefix(dataset_path + dataset + "/"),
+
+        # primary signal, duplicated into "score" so calculate_metrics works unchanged
+        "score": _cv(orbit),
+        "orbit_cv": _cv(orbit),
+        "orbit_var": orbit.var(unbiased=True).item(),
+        "orbit_offset": (ref - orbit.mean()).item(),
+        "abs_orbit_offset": abs((ref - orbit.mean()).item()),
+
+        # forward-only candidates
+        "gram_cv": _cv(gram_orbit),
+        "gram_erank_cv": _cv(gram_erank[1:]),
+        "gram_offset": (gram_ref - gram_orbit.mean()).item(),
+        "drift": drift,
+
+        # reference: view 0 is the timm eval transform, so this matches last_layer runs
+        "logdet": ref.item(),
+
+        # per-view vectors make the m-ablation a post-hoc pandas operation
+        "jepa_per_view": jepa_per_view.cpu().tolist(),
+        "gram_per_view": gram_logdet.cpu().tolist(),
+        "view_recipe": ["ref"] + ["t1" if i % 2 == 0 else "t2" for i in range(len(orbit))],
+
+        # view-0 spectrum only; storing all V would inflate the file ~13x
+        "svdvals": svdvals[0].cpu().tolist(),
+    }])
+    return batch_results
+
 
 def load_calibration_set(cal_set_path: Path, device: str = "cuda"):
     """
@@ -633,50 +809,320 @@ def score_all_layers_fast(
         "img_path": [p.removeprefix(dataset_path + dataset + "/") for p in img_path],
     })
 
-def calculate_metrics(full_output_path, dataset) -> None:
+
+def spectral_jepa_metrics(singular_values, eps=1e-12):
+    if singular_values.dim() == 1:
+        singular_values = singular_values.unsqueeze(0)
+
+    s = singular_values.clamp_min(eps)
+
+    p = s / s.sum(dim=1, keepdim=True).clamp_min(eps)
+
+    spectral_entropy = -(p * torch.log(p.clamp_min(eps))).sum(dim=1)
+    effective_rank = torch.exp(spectral_entropy)
+
+    nuclear_norm = s.sum(dim=1)
+    spectral_norm = s.max(dim=1).values
+
+    stable_rank = (s ** 2).sum(dim=1) / (spectral_norm ** 2 + eps)
+
+    condition_number = s.max(dim=1).values / s.min(dim=1).values.clamp_min(eps)
+
+    logdet_score = torch.log(s + eps).sum(dim=1)
+
+    return {
+        "spectral_entropy": spectral_entropy.detach().cpu().numpy(),
+        "effective_rank": effective_rank.detach().cpu().numpy(),
+        "nuclear_norm": nuclear_norm.detach().cpu().numpy(),
+        "spectral_norm": spectral_norm.detach().cpu().numpy(),
+        "stable_rank": stable_rank.detach().cpu().numpy(),
+        "condition_number": condition_number.detach().cpu().numpy(),
+        "logdet_score": logdet_score.detach().cpu().numpy(),
+    }
+
+def _radial_bin_index(H, W, n_bins, device):
+    """Maps every rfft2 output bin to a radial spatial-frequency bucket.
+    Returns a flat [H * (W//2+1)] index tensor for use with scatter_add_."""
+    fy = torch.fft.fftfreq(H, device=device).view(-1, 1)
+    fx = torch.fft.rfftfreq(W, device=device).view(1, -1)
+    r = torch.sqrt(fy ** 2 + fx ** 2)
+    r = r / r.max()
+    return (r * n_bins).long().clamp(max=n_bins - 1).reshape(-1)
+
+
+def jacobian_freq_profile(J_b, n_bins=32, chunk=64, window=True):
     """
-    Calculates AUC and AP for each class, overall (pooled), macro-average and weighted-average AUC/AP.
+    Radially averaged power spectrum of the Jacobian's input-space rows.
+
+    Each row of J_b is a gradient image d f_d / d x, so its 2D FFT says at which
+    spatial scale that output feature is locally sensitive. Because the DFT is
+    unitary and U is orthonormal, summing |FFT(row)|^2 over rows equals
+    sum_i sigma_i^2 |FFT(v_i)|^2, i.e. the sigma^2-weighted frequency
+    distribution of the right singular vectors, without needing a full SVD.
+    Summed over all bins it recovers ||J||_F^2 = sum_i sigma_i^2.
+
+    Args:
+        J_b: [D, C, H, W] Jacobian for a single image.
+        n_bins: number of radial frequency buckets.
+        chunk: rows per FFT call (caps peak memory).
+        window: apply a 2D Hann window to suppress spectral leakage.
+    Returns:
+        (profile [n_bins] normalised to sum 1, total energy). The energy equals
+        ||J||_F^2 exactly when window=False; with the Hann window it is scaled
+        by the window's mean square, (3/8)^2 ~= 0.1406, so compare it across
+        images rather than against sum_i sigma_i^2 directly.
+    """
+    D, C, H, W = J_b.shape
+    idx = _radial_bin_index(H, W, n_bins, J_b.device)
+    power = torch.zeros(n_bins, device=J_b.device, dtype=torch.float64)
+
+    # rfft2 drops the conjugate half, so every column except kx=0 (and Nyquist
+    # for even W) stands for two bins. Without this the total is ~||J||_F^2 / 2
+    # and the low-frequency bins are systematically under-weighted.
+    herm = torch.full((W // 2 + 1,), 2.0, device=J_b.device)
+    herm[0] = 1.0
+    if W % 2 == 0:
+        herm[-1] = 1.0
+
+    if window:
+        w = (torch.hann_window(H, device=J_b.device).unsqueeze(1)
+             * torch.hann_window(W, device=J_b.device).unsqueeze(0))
+
+    for s in range(0, D, chunk):  # chunked: the full FFT would be ~0.5 GB per image
+        blk = J_b[s:s + chunk]
+        if window:
+            blk = blk * w
+        F = torch.fft.rfft2(blk, norm="ortho")
+        p = ((F.real ** 2 + F.imag ** 2) * herm).sum(1)  # sum over colour channels
+        power.scatter_add_(0, idx, p.reshape(p.shape[0], -1).sum(0).double())
+
+    total = power.sum()
+    return power / total.clamp_min(1e-30), total
+
+
+def score_last_layer_spectral(model, img, device, eps, label, dataset_path, dataset, img_path, config) -> pd.DataFrame:
+    """
+    Calculates last-layer JEPA score plus spectral JEPA scores.
+
+    Main JEPA score:
+        score = sum_i log(sigma_i)
+
+    Spectral JEPA scores:
+        - spectral_entropy
+        - effective_rank
+        - nuclear_norm
+        - spectral_norm
+        - stable_rank
+        - condition_number
+        - logdet_score
+    """
+
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=config["fast_settings"]):
+        #with torch.no_grad():
+            #emb = model(img)  # [B, D]
+
+        J = jacobian(
+            lambda x: model(x).sum(0),
+            inputs=img,
+            vectorize=config["vectorize"],
+        )
+
+    with torch.inference_mode():
+        # Original JEPA Jacobian shape processing
+        J = J.flatten(2).permute(1, 0, 2).float()  # [B, D, C*H*W]
+
+        # Singular value spectrum
+        svdvals = torch.linalg.svdvals(J)  # [B, D]
+
+        # Original JEPA score
+        log_sv = svdvals.clamp_min(eps).log()
+        jepa_score = log_sv.sum(dim=1)  # [B]
+
+        # New spectral JEPA scores
+        spectral = spectral_jepa_metrics(svdvals, eps=eps)
+
+        # Radial frequency profile of the Jacobian (spatial scale of sensitivity)
+        if config.get("freq_profile", True):
+            C, H, W = img.shape[1:]
+            freq_profiles, jac_energies = [], []
+            for b in range(J.shape[0]):
+                prof, tot = jacobian_freq_profile(
+                    J[b].reshape(-1, C, H, W),
+                    n_bins=config.get("freq_bins", 32),
+                )
+                freq_profiles.append(prof.cpu().tolist())
+                jac_energies.append(tot.item())
+        else:
+            freq_profiles = [None] * J.shape[0]
+            jac_energies = [None] * J.shape[0]
+
+    batch_results = pd.DataFrame({
+        "label": label.cpu().tolist(),
+        "score": jepa_score.cpu().tolist(),
+
+        # Spectral JEPA scores
+        "spectral_entropy": spectral["spectral_entropy"].tolist(),
+        "effective_rank": spectral["effective_rank"].tolist(),
+        "nuclear_norm": spectral["nuclear_norm"].tolist(),
+        "spectral_norm": spectral["spectral_norm"].tolist(),
+        "stable_rank": spectral["stable_rank"].tolist(),
+        "condition_number": spectral["condition_number"].tolist(),
+        "logdet_score": spectral["logdet_score"].tolist(),
+
+        # Diagnostics / calibration
+        "img_path": [x.removeprefix(dataset_path + dataset + "/") for x in img_path],
+        "svdvals": svdvals.cpu().tolist(),
+        "freq_profile": freq_profiles,
+        "jac_energy": jac_energies,
+        #"embedding": emb.float().cpu().tolist(),
+    })
+
+    return batch_results
+
+CAL_DATASET = "Imagenet_val_5k"
+CAL_SIZE = 5000
+
+
+def load_calibration_thresholds(full_output_path, dataset, signals):
+    """
+    Finds the calibration run belonging to this output file and derives one
+    threshold per signal.
+
+    The calibration file is the Imagenet_val_5k run of the SAME backbone and the
+    SAME score_type, i.e. only the dataset part of the filename differs:
+        <backbone>/<backbone>_<score_type>_<dataset>.jsonl
+        <backbone>/<backbone>_<score_type>_Imagenet_val_5k.jsonl
+
+    Threshold = mean + std (ddof=1) over the calibration images, which are all
+    real -- so a test image scoring above it is an upper-tail outlier w.r.t. the
+    real distribution and is predicted fake.
+
+    Returns:
+        dict signal -> threshold, or None if no calibration file exists.
+    """
+    full_output_path = Path(full_output_path)
+    suffix = f"_{dataset}.jsonl"
+    assert full_output_path.name.endswith(suffix), \
+        f"Expected output file to end with '{suffix}', got {full_output_path.name}"
+    cal_path = full_output_path.with_name(
+        full_output_path.name[: -len(suffix)] + f"_{CAL_DATASET}.jsonl"
+    )
+
+    if not cal_path.exists():
+        print(f"No calibration set found at {cal_path}. Skipping ACC/F1.")
+        return None
+
+    with open(cal_path, "r") as f:
+        next(f)  # skip metadata line
+        cal = pd.read_json(f, lines=True)
+
+    if len(cal) != CAL_SIZE:
+        raise ValueError(
+            f"Calibration set {cal_path.name} has {len(cal)} entries, expected {CAL_SIZE}. "
+            f"The run is probably incomplete -- finish it before calculating ACC/F1."
+        )
+
+    thresholds = {s: cal[s].mean() + cal[s].std() for s in signals & set(cal.columns)}
+    print(f"Calibration set: {cal_path.name} ({len(cal)} images), "
+          f"thresholds for {sorted(thresholds)}")
+
+    print(thresholds)
+    return thresholds
+
+
+def calculate_metrics(full_output_path, dataset) -> pd.DataFrame:
+    """
+    Calculates AUC, AP, ACC and F1 for each class plus the macro-average.
     Prints all metrics in a table.
+
+    ACC/F1 need a decision threshold, which comes from the calibration run of the
+    same backbone and score_type (see load_calibration_thresholds). They are
+    omitted when no calibration file exists.
     Args:
         full_output_path: path to output file
         dataset: dataset name
     Returns:
-        None
+        results: the printed metrics table
     """
 
     CLASSES = {
-        "ForenSynths": ["biggan", "crn", "cyclegan", "deepfake", "gaugan", "imle", "progan", "san", "seeingdark", "stargan", "stylegan", "stylegan2", "whichfaceisreal"],
+        "ForenSynths": ["biggan", "cyclegan", "gaugan", "progan", "stargan", "stylegan", "stylegan2"],
         "ForenSynths_val": ["ForenSynths_val"],
-        "NewGenerators": None, #TODO
+        "New-Generator": ["dalle3", "firefly", "flux", "midjourney-v5", "sd3", "sdxl"],
+        "New-Generator_COCO17_unbiased": ["flux", "sd3", "sdxl"],
+        "New-Generator_RAISE1k_unbiased": ["dalle3", "firefly", "midjourney-v5"],
         "GenImage": None, #TODO
     }
+
+    # NOTE: spectral_entropy is a monotone transform of effective_rank
+    # (erank = exp(entropy)), so its AUC is always identical -- kept only for
+    # backwards compatibility with existing output files.
+    SIGNALS = {"score", "spectral_entropy",
+               "effective_rank", "nuclear_norm",
+               "spectral_norm", "stable_rank",
+               "condition_number", "logdet_score",
+               # orbit features
+               "orbit_cv", "orbit_var", "abs_orbit_offset",
+               "gram_cv", "gram_erank_cv", "drift", "logdet"}
+    
 
     with open(full_output_path, "r") as f:
         next(f)  # skip metadata line
         df = pd.read_json(f, lines=True)
+    keys = set(df.columns)
     print(len(df))
-    classes = CLASSES[dataset]
-    AUCs, APs, counts = [], [], []
-    for cls in classes:
-        subset = df[df["img_path"].str.split("/").str[0] == cls].copy()
-        AUCs.append(roc_auc_score(subset.label, subset.score))
-        APs.append(average_precision_score(subset.label, subset.score))
-        counts.append(len(subset))
 
-    total = sum(counts)
-    overall_auc = roc_auc_score(df.label, df.score)
-    overall_ap = average_precision_score(df.label, df.score)
-    macro_auc, macro_ap = mean(AUCs), mean(APs)
-    #TODO implement for GANs only
-    weighted_auc = sum(a * n for a, n in zip(AUCs, counts)) / total
-    weighted_ap  = sum(a * n for a, n in zip(APs,  counts)) / total
+    thresholds = load_calibration_thresholds(full_output_path, dataset, SIGNALS)
 
-    results = pd.DataFrame({
-        "class": classes + ["Overall (pooled)", "Macro-average", "Weighted-average"],
-        "N":     counts  + [total, None, total],
-        "AUC":   AUCs    + [overall_auc, macro_auc, weighted_auc],
-        "AP":    APs     + [overall_ap,  macro_ap,  weighted_ap],
-    })
+    records = []
+    for cls in CLASSES[dataset]:
+        subset = df[df["img_path"].str.split("/").str[0] == cls]
+        for signal in SIGNALS & keys:
+            if dataset == "ForenSynths":
+                eval_df = subset
 
-    print(f"\nResults on {dataset}")
-    print(results.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+            elif dataset in {"New-Generator", "New-Generator_COCO17_unbiased", "New-Generator_RAISE1k_unbiased"}:
+                df_gen_real = df[df["img_path"].str.contains("real/")].copy()
+                df_gen_real["class"] = "real"
+                df_gen_fake = df[df["img_path"].str.contains(cls + "/")].copy()
+                eval_df = pd.concat([df_gen_fake, df_gen_real])
+
+            else:
+                # without this, eval_df would silently carry over from the
+                # previous loop iteration and score the wrong images.
+                raise ValueError(
+                    f"No evaluation grouping defined for dataset '{dataset}'. "
+                    f"Add a branch here before calling calculate_metrics on it."
+                )
+
+            record = {
+                "class": cls,
+                "signal": signal,
+                "n": len(subset),
+                "AUC": roc_auc_score(eval_df.label, eval_df[signal]),
+                "AP": average_precision_score(eval_df.label, eval_df[signal]),
+            }
+            if thresholds and signal in thresholds:
+                # upper-tail rule: above the calibration threshold -> predicted fake
+                pred = (eval_df[signal] > thresholds[signal]).astype(float)
+                record["ACC"] = accuracy_score(eval_df.label, pred)
+                record["F1"] = f1_score(eval_df.label, pred)
+            records.append(record)
+
+
+    results = pd.DataFrame(records)
+    metric_cols = [c for c in ["AUC", "AP", "ACC", "F1"] if c in results.columns]
+    # Macro average over classes, per signal
+    macro = (
+        results.groupby("signal")[metric_cols]
+        .mean()
+        .reset_index()
+        .assign(**{"class": "macro_avg", "n": results.groupby("signal")["n"].sum().values})
+    )
+
+    results = pd.concat([results, macro], ignore_index=True)
+    pd.set_option("display.max_rows", None)
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.expand_frame_repr", False)  # one line per row in slurm logs
+    print(results)
+    return results

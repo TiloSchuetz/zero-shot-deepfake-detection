@@ -10,15 +10,32 @@ from contextlib import nullcontext
 import json
 from datetime import datetime, timezone
 
-from helpers import load_model, create_pd_data_paths, create_pd_data_paths_recursive, create_pd_data_paths_New_Generators, resume_or_create_dataset_dataloader_json, score_last_layer, calculate_metrics, load_calibration_set, conditional_score_last_layer, score_all_layers, score_all_layers_fast
+from helpers import (
+    load_model,
+    create_pd_data_paths,
+    create_pd_data_paths_recursive,
+    create_pd_data_paths_New_Generators,
+    resume_or_create_dataset_dataloader_json,
+    score_last_layer, calculate_metrics,
+    load_calibration_set,
+    conditional_score_last_layer,
+    score_all_layers,
+    score_all_layers_fast,
+    score_last_layer_spectral,
+    score_orbit,
+    resume_or_create_orbit_dataloader_json)
 
-#TODO simplify?
+from orbit_aug import build_orbit_transforms
+
+#TODO simplify
 DATASET_PATHS = {
     "ForenSynths": "/ceph/tischuet/replication_data/",
     "New-Generator": "/ceph/tischuet/replication_data/",
-    "Imagenet_val_5k": "/ceph/tischuet/",
+    "Imagenet_val_5k": "/ceph/tischuet/replication_data/",
     "ForenSynths_val": "/ceph/tischuet/replication_data/",
     "ForenSynths_rest": "/ceph/tischuet/replication_data/",
+    "New-Generator_COCO17_unbiased": "/ceph/tischuet/replication_data/",
+    "New-Generator_RAISE1k_unbiased": "/ceph/tischuet/replication_data/",
     }
 
 CONFIG_FOLDER_PATH = Path("./configs")
@@ -33,19 +50,25 @@ MODELS = {
     "vit_base_patch16_dinov3.lvd1689m",
     "vit_large_patch16_dinov3.lvd1689m",
     "vit_large_patch14_dinov2.lvd142m",
-    "vit_base_patch16_clip_224.openai",
-    "vit_base_patch32_clip_224.openai",
-    "vit_large_patch14_clip_224.openai",
+    "vit_base_patch16_clip_quickgelu_224.openai", # vit_base_patch16_clip_224.openai would use clip with GELU, which is not how it was trained by OpenAI
+    "vit_base_patch32_clip_quickgelu_224.openai",
+    "vit_large_patch14_clip_quickgelu_224.openai",
+    "vit_large_patch14_dinov2.lvd142m",
+    "vit_base_patch14_dinov2.lvd142m",
     }
 
 REQUIRED_KEYS = {"model_name", "fast_settings", "dataset", "batch_size", "profiler",
                  "vectorize", "score_type", "cal_set_path", "k_neighbors"}
 
+ORBIT_KEYS = {"m_views", "orbit_seed", "global_crops_scale"}
+
 SCORERS = {
     "last_layer": score_last_layer,
+    "last_layer_spectral": score_last_layer_spectral,
     "layerwise": score_all_layers, #TODO implement drop in layer-wise JEPA-SCORE calcs with singular value spectrum
     "layerwise_fast": score_all_layers_fast,
     "local_last_layer": conditional_score_last_layer,
+    "orbit": score_orbit,
 }
 
 def main(args):
@@ -55,13 +78,17 @@ def main(args):
     with open(CONFIG_FOLDER_PATH / args.config, 'r') as f:
         config = yaml.load(f, Loader=yaml.SafeLoader)
     
-    # check if all necessary keys exist
-    if config["score_type"] in {"last_layer", "layerwise", "layerwise_fast"}:
+    # check if all necessary keys exist TODO make dependend on SCORERS
+    if config["score_type"] in {"last_layer", "layerwise", "layerwise_fast", "last_layer_spectral"}:
         missing = REQUIRED_KEYS - {"cal_set_path", "k_neighbors"} - config.keys()
         if missing:
             raise ValueError(f"Config is missing required keys: {missing}")
     elif config["score_type"] == "local_last_layer":
         missing = REQUIRED_KEYS - config.keys()
+        if missing:
+            raise ValueError(f"Config is missing required keys: {missing}")
+    elif config["score_type"] == "orbit":
+        missing = (REQUIRED_KEYS - {"cal_set_path", "k_neighbors"} | ORBIT_KEYS) - config.keys()
         if missing:
             raise ValueError(f"Config is missing required keys: {missing}")
     else: raise ValueError(f"This score_type doesn't exist")
@@ -144,17 +171,35 @@ def main(args):
     dataset = config["dataset"]
     dataset_path = DATASET_PATHS[dataset]
     
+    # TODO this is ugly
     if dataset == "Imagenet_val_5k":
         filenames_labels = create_pd_data_paths(dataset_path, dataset)
-    elif dataset in set(DATASET_PATHS.keys()) - {"Imagenet_val", "New-Generator"}:
+    elif dataset in set(DATASET_PATHS.keys()) - {"Imagenet_val", "New-Generator", "New-Generator_COCO17_unbiased", "New-Generator_RAISE1k_unbiased"}:
         filenames_labels = create_pd_data_paths_recursive(dataset_path, dataset)
-    elif dataset == "New-Generator":
+    elif dataset in {"New-Generator", "New-Generator_COCO17_unbiased", "New-Generator_RAISE1k_unbiased"}:
         filenames_labels = create_pd_data_paths_New_Generators(dataset_path, dataset)
     else:
         raise ValueError(
             f"Unknown data folder '{dataset}'.\n"
             f"  Available: {set(DATASET_PATHS.keys())}"
         )
+
+    # Optional seeded per-generator subsample. Orbit scoring costs (1+m) Jacobians
+    # per image, so first-pass AUC estimates are taken on a subset.
+    if config.get("subset_per_class"):
+        k = config["subset_per_class"]
+        seed = config.get("orbit_seed", 0)
+        # Group on (generator, label), not generator alone. For New-Generator the
+        # top-level folder already determines the label, but ForenSynths nests both
+        # classes under one generator (stylegan/car/{0_real,1_fake}) -- grouping on
+        # the folder only would draw k images of mixed label per generator.
+        generator = filenames_labels["img_path"].str.split("/").str[0]
+        filenames_labels = (
+            filenames_labels
+            .groupby([generator, filenames_labels["label"]], group_keys=False)
+            .apply(lambda g: g.sample(min(k, len(g)), random_state=seed))
+        )
+        print(f"Subsampled to {k} images per (generator, label) (seed={seed}).")
 
     print(filenames_labels.label.value_counts())
 
@@ -180,13 +225,31 @@ def main(args):
             f.write(json.dumps(metadata) + "\n")
 
 
-    data_loader = resume_or_create_dataset_dataloader_json(
-                full_output_path,
-                filenames_labels,
-                dataset_path,
-                dataset,
-                transforms,
-                config["batch_size"])
+    if config["score_type"] == "orbit":
+        t0, t1, t2 = build_orbit_transforms(
+            img_size=data_config["input_size"][-1],
+            mean=data_config["mean"],
+            std=data_config["std"],
+            global_crops_scale=config["global_crops_scale"],
+        )
+        print(f"Orbit augmentations: DINOv3 global_transfo1/2, "
+              f"scale={tuple(config['global_crops_scale'])}, m={config['m_views']}")
+        data_loader = resume_or_create_orbit_dataloader_json(
+                    full_output_path,
+                    filenames_labels,
+                    dataset_path,
+                    dataset,
+                    t0, t1, t2,
+                    m=config["m_views"],
+                    seed=config["orbit_seed"])
+    else:
+        data_loader = resume_or_create_dataset_dataloader_json(
+                    full_output_path,
+                    filenames_labels,
+                    dataset_path,
+                    dataset,
+                    transforms,
+                    config["batch_size"])
 
     # Build the profiler once, outside the loop
     def trace_handler(prof):
@@ -211,6 +274,10 @@ def main(args):
 
     with profiler_ctx as prof:
         for i, (img, label, img_path) in tqdm(enumerate(data_loader), total=len(data_loader), desc="Computing JEPA scores"):
+            if config["score_type"] == "orbit":
+                # [1, 1+m, C, H, W] -> [1+m, C, H, W]: the orbit is the batch, and
+                # this shape is constant for every step (one CUDA graph capture).
+                img = img.squeeze(0)
             img = img.to(device).requires_grad_(True)
 
             if config["score_type"] == "local_last_layer":
